@@ -1,0 +1,15 @@
+# ESPHome
+esphome/secrets.yaml
+esphome/.esphome/
+esphome/*.bin
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# local / editor
+.DS_Store
+*.local
+scratch/

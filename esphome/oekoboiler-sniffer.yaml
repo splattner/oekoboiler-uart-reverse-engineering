@@ -1,0 +1,317 @@
+# Ökoboiler internal-UART sniffer + decoder for ESPHome
+# See https://github.com/<you>/oekoboiler-uart-reverse-engineering
+#
+# Provide these in secrets.yaml:
+#   wifi_ssid, wifi_password, api_encryption_key, mqtt_broker, mqtt_username, mqtt_password
+#
+# Wiring: tap the single UART data line to rx_pin (GPIO19 here) via the board's
+# optoisolated output; share GND. 2400 baud 8N1. RX only (read-only sniffer).
+
+esphome:
+  name: oekoboiler-sniffer
+  on_boot:
+    priority: 600
+    then:
+      - lambda: |-
+          esp_ota_mark_app_valid_cancel_rollback();
+
+esp32:
+  board: esp32-c6-devkitc-1
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE: "n"
+
+# Enable logging
+logger:
+  level: DEBUG
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+safe_mode:
+
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+
+mqtt:
+  id: mqtt_client
+  broker: !secret mqtt_broker
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  topic_prefix: oekoboiler
+  discovery: false
+  on_connect:
+    - delay: 10s
+    - lambda: id(mqtt_ready) = true;
+  on_disconnect:
+    - lambda: id(mqtt_ready) = false;
+
+
+uart:
+  id: boiler_uart
+  rx_pin: GPIO19
+  baud_rate: 2400
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+
+globals:
+  - id: frame_buffer
+    type: std::vector<uint8_t>
+    restore_value: no
+  - id: mqtt_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # --- water-temperature continuity decoder state ---
+  - id: wt_acc          # wrap accumulator (multiples of 64)
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: wt_prev_fine    # previous fine value
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: wt_anchored     # has an absolute anchor been set?
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+binary_sensor:
+  - platform: template
+    name: "PV Mode"
+    id: pv_mode
+    device_class: running
+  # flags when the two water-temp decoders disagree (missed wrap / out-of-calibration)
+  - platform: template
+    name: "Water Temp Decoders Disagree"
+    id: water_temp_mismatch
+    device_class: problem
+
+switch:
+  - platform: template
+    name: "UART Sniffing"
+    id: uart_sniffing
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+text_sensor:
+  - platform: template
+    name: "Boiler Mode"
+    id: boiler_mode
+
+sensor:
+  - platform: template
+    name: "Water Temperature (continuity)"
+    id: water_temp_continuity
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle_average: 15s
+  - platform: template
+    name: "Water Temperature (stateless)"
+    id: water_temp_stateless
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle_average: 15s
+  # Setpoint isn't sent on the UART; derive it from PV mode (matches the menu config).
+  - platform: template
+    name: "Water Temperature Setpoint"
+    id: water_setpoint
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          // Skip processing until MQTT is connected and ready, and sniffing is enabled
+          if (!id(mqtt_ready) || !id(uart_sniffing).state) return;
+          auto *uart = id(boiler_uart);
+          auto &buf = id(frame_buffer);
+          size_t bytes_read = 0;
+          char incoming_bytes[256];
+          size_t incoming_len = 0;
+
+          incoming_bytes[0] = 0;
+
+          // Read all available bytes from UART into the frame buffer
+          while (uart->available()) {
+            uint8_t b;
+            uart->read_byte(&b);
+            buf.push_back(b);
+            bytes_read++;
+
+            if (incoming_len + 4 < sizeof(incoming_bytes)) {
+              incoming_len += snprintf(incoming_bytes + incoming_len, sizeof(incoming_bytes) - incoming_len, "%02X ", b);
+            }
+          }
+
+          // Process complete 32-byte frames from the buffer
+          while (buf.size() >= 32) {
+            // Scan for frame header: must start with 0x64 0x41
+            if (buf[0] != 0x64 || buf[1] != 0x41) {
+              ESP_LOGV("oekoboiler", "Discarding byte 0x%02X while searching for frame header", buf[0]);
+              buf.erase(buf.begin());
+              continue;
+            }
+
+            // Copy the candidate frame out of the buffer
+            uint8_t frame[32];
+            for (int i = 0; i < 32; i++)
+              frame[i] = buf[i];
+
+            // CRC-16/Modbus over bytes 0..29; CRC stored little-endian in bytes 30..31
+            auto crc16 = [](uint8_t *data, int len) {
+              uint16_t crc = 0xFFFF;
+              for (int i = 0; i < len; i++) {
+                crc ^= data[i];
+                for (int j = 0; j < 8; j++) {
+                  if (crc & 1)
+                    crc = (crc >> 1) ^ 0xA001;
+                  else
+                    crc >>= 1;
+                }
+              }
+              return crc;
+            };
+
+            uint16_t crc_calc = crc16(frame, 30);
+            uint16_t crc_frame = frame[30] | (frame[31] << 8);
+
+            // Build hex string of the raw (unmasked) frame
+            char raw_str[200];
+            raw_str[0] = 0;
+
+            for (int i = 0; i < 32; i++) {
+              char tmp[8];
+
+              sprintf(tmp, "%02X ", frame[i]);
+              strcat(raw_str, tmp);
+            }
+            if (strlen(raw_str) > 0) raw_str[strlen(raw_str) - 1] = 0;  // trim trailing space
+
+            // Frame byte 5 is the masking key; XOR bytes 2..29 to decode the payload
+            uint8_t mask = frame[5];
+            uint8_t masked_frame[32];
+            for (int i = 0; i < 32; i++)
+              masked_frame[i] = frame[i];
+            for (int i = 2; i <= 29; i++)
+              masked_frame[i] = frame[i] ^ mask;
+
+            // Build hex string of the masked (decoded) frame
+            char masked_str[200];
+            masked_str[0] = 0;
+            for (int i = 0; i < 32; i++) {
+              char tmp[8];
+              sprintf(tmp, "%02X ", masked_frame[i]);
+              strcat(masked_str, tmp);
+            }
+            if (strlen(masked_str) > 0) masked_str[strlen(masked_str) - 1] = 0;  // trim trailing space
+
+            char crc_str[8];
+            sprintf(crc_str, "%04X", crc_frame);
+
+            // Build JSON payload with raw frame, decoded frame and CRC
+            char payload[700];
+            sprintf(payload,
+              "{\"raw\":\"%s\",\"masked\":\"%s\",\"crc\":\"%s\"}",
+              raw_str, masked_str, crc_str);
+
+            // All payload decoding happens only on CRC-valid frames, so a corrupted
+            // frame can never flip PV/mode/temperature to a wrong value.
+            if (crc_calc == crc_frame) {
+
+              // ===== CE frames: PV mode + water temperature =====
+              if (masked_frame[11] == 0xCE) {
+
+                // --- PV Mode: byte 10 bit 0x40 clear = PV on ---
+                bool pv = (masked_frame[10] & 0x40) == 0;
+                if (!id(pv_mode).has_state() || pv != id(pv_mode).state)
+                  id(pv_mode).publish_state(pv);
+
+                // Setpoint follows PV mode: 60 degC on PV surplus, 50 degC otherwise.
+                float setpoint = pv ? 60.0f : 50.0f;
+                if (!id(water_setpoint).has_state() || setpoint != id(water_setpoint).state)
+                  id(water_setpoint).publish_state(setpoint);
+
+                // --- Water temperature ---
+                // byte14 = fine temp (~10 units/degC, byte falls as temp rises, wraps every ~6.4 degC)
+                // byte15 = coarse band: 206 => ~47-52 degC, 205 => ~51-60 degC
+                // Calibrated over 47-60 degC (2026-07-07/08). ~0.3 degC mean error vs OCR.
+                const float WT_A = 60.62f, WT_B = 0.0986f;   // temp = A - B*(fine + acc)
+                int fine = masked_frame[14] % 64;
+                int b15  = masked_frame[15];
+
+                // --- Decoder B: stateless (no memory, survives reboots) ---
+                // Computed FIRST so it can seed the continuity decoder's cold start.
+                int raw = masked_frame[14];
+                float center = (b15 == 206) ? 49.5f : 55.5f;
+                int kB = (int) lroundf((((WT_A - center) / WT_B) - fine) / 64.0f);
+                float tempB = WT_A - WT_B * (fine + 64 * kB);
+                if (b15 != 206) {                            // 205 band > 1 wrap: full-byte tiebreak
+                  if (raw >= 64 && tempB < 57.0f) { kB -= 1; tempB = WT_A - WT_B * (fine + 64 * kB); }
+                  if (raw <  64 && tempB > 57.5f) { kB += 1; tempB = WT_A - WT_B * (fine + 64 * kB); }
+                }
+                id(water_temp_stateless).publish_state(tempB);
+
+                // --- Decoder A: continuity, re-anchored in the unambiguous b15==206 band ---
+                if (b15 == 206) {                            // 47-52 degC: one wrap wide => absolute
+                  id(wt_acc) = 64 * (int) lroundf((112.8f - fine) / 64.0f);
+                  id(wt_anchored) = true;
+                } else if (!id(wt_anchored)) {               // cold start: seed from the stateless wrap
+                  id(wt_acc) = 64 * kB;
+                  id(wt_anchored) = true;
+                } else {                                     // track wraps frame-to-frame
+                  int d = fine - id(wt_prev_fine);
+                  if (d > 32) id(wt_acc) -= 64;
+                  else if (d < -32) id(wt_acc) += 64;
+                }
+                id(wt_prev_fine) = fine;
+                float tempA = WT_A - WT_B * (fine + id(wt_acc));
+                id(water_temp_continuity).publish_state(tempA);
+
+                // --- flag when the two decoders disagree by > 1 degC ---
+                bool mismatch = fabsf(tempA - tempB) > 1.0f;
+                if (mismatch != id(water_temp_mismatch).state)
+                  id(water_temp_mismatch).publish_state(mismatch);
+              }
+
+              // ===== CF frames: operating mode (lower 5 bits of byte 10) =====
+              if (masked_frame[11] == 0xCF) {
+                uint8_t mode = masked_frame[10] & 0x1F;
+                std::string mode_str;
+                if (mode == 0x10)      mode_str = "heating";
+                else if (mode == 0x19) mode_str = "warm";
+                else if (mode == 0x1D) mode_str = "defrost";
+                if (!mode_str.empty() && mode_str != id(boiler_mode).state)
+                  id(boiler_mode).publish_state(mode_str.c_str());
+              }
+
+              ESP_LOGV("oekoboiler", "Valid frame received, yeah: %s", raw_str);
+              id(mqtt_client).publish("oekoboiler/frame", payload);
+            } else {
+              ESP_LOGV("oekoboiler", "CRC mismatch for frame %s(calc=0x%04X recv=0x%04X)", raw_str, crc_calc, crc_frame);
+              bool pub_ok = id(mqtt_client).publish("oekoboiler/raw", payload);
+
+            }
+
+            // Consume the processed frame from the buffer
+            buf.erase(buf.begin(), buf.begin() + 32);
+          }
