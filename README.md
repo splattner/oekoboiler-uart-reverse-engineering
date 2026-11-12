@@ -430,9 +430,9 @@ Full details in [`PROTOCOL.md`](PROTOCOL.md). The short version:
 ## What's still open
 
 - **Channel names.** Coil vs return gas now follows from superheat and the expansion valve (see below); ambient vs exhaust is still from behaviour only. A clamp-on probe would settle them for good.
-- **Expansion valve.** `cf[14/15]` behaves like a superheat-controlled EEV in motor steps. Still to see: the valve stopping or reversing as superheat recovers.
 - **Tank ground truth.** The int16 model agrees with the OCR'd display over 46–60 °C; a day of OCR across a deep draw-off would confirm it below that.
-- **The rest of the frame.** With the key understood, the remaining CE/CF bytes (`24..29`, the mode bits, the `ce[4]`/`cf[2]` nonce) are worth another pass.
+- **The rest of the frame.** With the key understood, the remaining CE/CF bytes (`24..29`, the mode bits) are worth another pass. The `ce[4]`/`cf[2]` "nonce" turned out to be a check byte computed from the mask: `((raw[5] ^ 0x5A) + 1)` (see PROTOCOL.md).
+- **Restart threshold.** Heating stops at setpoint − 0.5 °C; where it restarts is still to be seen (more than 0.4 K below the setpoint).
 - **Setpoint** appears to be derived from PV state rather than sent as a plain number; still confirming.
 
 ---

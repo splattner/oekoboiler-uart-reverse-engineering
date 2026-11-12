@@ -186,8 +186,22 @@ Keyed with the matching CF bytes (`56 E3`, `71 BC`, `3F 58`), these are three mo
 slots that read a constant −12.8/−12.9 and −6.4/−6.5 with a one-count flicker: most likely
 inputs with nothing connected. (Earlier notes called them a "heartbeat".)
 
+### Mask check byte — `raw[4]` (CE) / `raw[2]` (CF)
+
+One byte in each frame is derived from the mask itself:
+
+```
+raw[4] (CE)  =  raw[2] (CF)  =  ((raw[5] ^ 0x5A) + 1) & 0xFF
+```
+
+This holds for all 355 raw frames captured on 2026-11-12 (178 CE, 177 CF). Its demasked form
+looked like a mystery counter: with `m = raw[5] ^ 0x5A`,
+`dec = raw ^ raw[5] = (m + 1) ^ m ^ 0x5A`. And `(m + 1) ^ m` is always `2^k − 1`, with `k`
+being one more than the number of trailing 1-bits of `m`. So `dec ^ 0x5A` takes the values
+1, 3, 7, 15… with probability ½, ¼, ⅛… for a random mask. That is exactly the "geometric"
+distribution observed. It carries no information beyond the mask; a receiver can use it as a
+sanity check on `raw[5]`.
+
 ### Not understood yet
 
-- `raw[5]`, the per-frame mask, is pseudo-random, not a counter.
-- `dec[4]` (CE) and `dec[2]` (CF) carry the same field at different offsets: `value ^ 0x5A`
-  is always `2^k − 1`, with `k = 1` half the time, `k = 2` a quarter, and so on.
+- `raw[5]`, the per-frame mask, is pseudo-random, not a counter. How it is generated is unknown.
