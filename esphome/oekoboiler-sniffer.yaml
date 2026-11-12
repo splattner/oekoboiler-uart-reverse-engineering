@@ -104,11 +104,12 @@ sensor:
     accuracy_decimals: 1
     filters:
       - throttle_average: 15s
-  # Channel names for the four heat-pump sensors are provisional: identified from
-  # their behaviour across heating -> idle, not from labels on the board.
+  # Channel names for the four heat-pump sensors are inferred from behaviour, not
+  # from board labels. Coil vs return gas follows from superheat: at compressor start
+  # dec[16/17] drops first and lowest (evaporator), dec[22/23] lags (suction gas).
   - platform: template
-    name: "Return Gas Temperature"        # dec[16/17]: ~2 degC while heating, rises to ambient after
-    id: return_gas_temp
+    name: "Coil Temperature"              # dec[16/17]: evaporator, ~2 degC while heating
+    id: coil_temp
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -134,14 +135,24 @@ sensor:
     filters:
       - throttle_average: 15s
   - platform: template
-    name: "Coil Temperature"              # dec[22/23]: evaporator, ~2 degC while heating
-    id: coil_temp
+    name: "Return Gas Temperature"        # dec[22/23]: suction gas, a little above the coil while heating
+    id: return_gas_temp
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
     accuracy_decimals: 1
     filters:
       - throttle_average: 15s
+  # Electronic expansion valve position (motor steps), from CF frames. Parks at 480
+  # when idle, starts at ~280 when heating begins, then moves +-1 step per 30 s to
+  # hold superheat (return gas - coil).
+  - platform: template
+    name: "Expansion Valve Position"
+    id: eev_position
+    unit_of_measurement: "steps"
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
   # Setpoint isn't sent on the UART; derive it from PV mode (matches the menu config).
   - platform: template
     name: "Water Temperature Setpoint"
@@ -279,13 +290,13 @@ interval:
                   if (t > -40.0f && t < 120.0f) s->publish_state(t);   // plausibility guard
                 };
                 pub(id(water_temp),      t16(14, 0x1D, 0xCF));
-                pub(id(return_gas_temp), t16(16, 0x7E, 0x90));
+                pub(id(coil_temp),       t16(16, 0x7E, 0x90));
                 pub(id(ambient_temp),    t16(18, 0x0F, 0x24));
                 pub(id(exhaust_temp),    t16(20, 0x60, 0xA1));
-                pub(id(coil_temp),       t16(22, 0xEC, 0x5E));
+                pub(id(return_gas_temp), t16(22, 0xEC, 0x5E));
               }
 
-              // ===== CF frames: operating mode (lower 5 bits of byte 10) =====
+              // ===== CF frames: operating mode + expansion valve position =====
               if (masked_frame[11] == 0xCF) {
                 uint8_t mode = masked_frame[10] & 0x1F;
                 std::string mode_str;
@@ -294,6 +305,13 @@ interval:
                 else if (mode == 0x1D) mode_str = "defrost";
                 if (!mode_str.empty() && mode_str != id(boiler_mode).state)
                   id(boiler_mode).publish_state(mode_str.c_str());
+
+                // --- Expansion valve position: int16 LE at 14/15, same key as the tank ---
+                // Reads -1 for ~2 s when the end-of-run defrost starts; skip that.
+                int16_t eev = (int16_t) (((uint16_t) (masked_frame[15] ^ 0xCF) << 8) |
+                                          (uint8_t) (masked_frame[14] ^ 0x1D));
+                if (eev >= 0 && (!id(eev_position).has_state() || eev != id(eev_position).state))
+                  id(eev_position).publish_state(eev);
               }
 
               ESP_LOGV("oekoboiler", "Valid frame received: %s", raw_str);

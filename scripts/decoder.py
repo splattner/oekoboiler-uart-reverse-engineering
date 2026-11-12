@@ -15,22 +15,22 @@ from dataclasses import dataclass
 
 # Second-layer key: a FIXED XOR per payload position, applied on top of the
 # per-frame raw[5] mask. CF frames send most of it in the clear (their payload is
-# mostly zero); KEY[14] differs from cf[14] because cf[14] carries a timer.
+# mostly zero); KEY[14] differs from cf[14] because cf[14] carries the valve position.
 KEY = {
     14: 0x1D, 15: 0xCF,   # tank / water
-    16: 0x7E, 17: 0x90,   # return gas   (provisional name)
-    18: 0x0F, 19: 0x24,   # ambient      (provisional name)
-    20: 0x60, 21: 0xA1,   # exhaust      (provisional name)
-    22: 0xEC, 23: 0x5E,   # coil         (provisional name)
+    16: 0x7E, 17: 0x90,   # coil / evaporator  (name inferred from behaviour)
+    18: 0x0F, 19: 0x24,   # ambient            (name inferred from behaviour)
+    20: 0x60, 21: 0xA1,   # exhaust            (name inferred from behaviour)
+    22: 0xEC, 23: 0x5E,   # return gas         (name inferred from behaviour)
 }
 
 # (low byte index, name) of each int16 temperature channel in CE frames
 TEMP_CHANNELS = {
     14: "water",
-    16: "return_gas",
+    16: "coil",
     18: "ambient",
     20: "exhaust",
-    22: "coil",
+    22: "return_gas",
 }
 
 
@@ -100,6 +100,11 @@ class Frame:
     def temperatures(self) -> dict[str, float]:    # CE frames
         return {name: temp16(self.dec, lo) for lo, name in TEMP_CHANNELS.items()}
 
+    @property
+    def valve_steps(self) -> int:                  # CF frames: expansion valve position
+        v = (self.dec[14] ^ KEY[14]) | ((self.dec[15] ^ KEY[15]) << 8)
+        return v - 0x10000 if v >= 0x8000 else v
+
 
 def parse(frame: bytes) -> Frame:
     assert len(frame) == 32, "frame must be 32 bytes"
@@ -139,8 +144,16 @@ if __name__ == "__main__":
         assert abs(t - ref) < 1.0
 
     # 2) round trip through a full synthetic frame (mask, CRC, all channels)
-    want = {"water": 49.6, "return_gas": 1.6, "ambient": 13.5, "exhaust": 54.8, "coil": -3.2}
+    want = {"water": 49.6, "coil": -3.2, "ambient": 13.5, "exhaust": 54.8, "return_gas": 1.6}
     f = parse(_build_ce_frame(want))
     assert f.crc_ok and f.signature_ok and f.is_ce
     assert all(abs(f.temperatures[k] - v) < 1e-9 for k, v in want.items()), f.temperatures
     print("round trip OK:", f.temperatures)
+
+    # 3) expansion valve position from real CF bytes (idle park, start, running)
+    for cf14, cf15, steps in [(0xFD, 0xCE, 480), (0xE7, 0xCF, 250), (0xE2, 0x30, -1)]:
+        dec = bytearray(32)
+        dec[11], dec[14], dec[15] = 0xCF, cf14, cf15
+        got = Frame(raw=bytes(32), dec=bytes(dec), crc_ok=True).valve_steps
+        assert got == steps, (cf14, cf15, got)
+    print("valve OK: idle 480, running 250, defrost start -1")

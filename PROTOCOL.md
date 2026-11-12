@@ -47,7 +47,7 @@ your framing or XOR is wrong. (Zero variance across the entire capture.)
 On top of the per-frame `raw[5]` mask, the payload carries a **second XOR key that is
 fixed per byte position** (identical in every frame, both families). CF frames are
 mostly zero in clear text, so they transmit most of this key verbatim: `cf[16..23]`
-never change. Where CF carries data (`cf[14]` is a timer), the key had to be recovered
+never change. Where CF carries data (`cf[14]` is the expansion-valve position), the key had to be recovered
 from the CE traffic itself (see [`scripts/keyscan.py`](scripts/keyscan.py)).
 
 | pos | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 |
@@ -78,10 +78,24 @@ Only act on frames whose CRC validates — a corrupted frame that happens to kee
 
 | `dec[11]` | Called here | Carries |
 |---|---|---|
-| `0xCE` | **CE** | PV mode, **water temperature** |
-| `0xCF` | **CF** | operating mode |
+| `0xCE` | **CE** | main board → panel: PV input flag, **all temperature sensors** |
+| `0xCF` | **CF** | panel → main board: operating mode, expansion-valve position |
 
-(Which physical board originates which family is unresolved and irrelevant to decoding.)
+**Direction (inferred, 2026-11-12).** The two families arrive 1:1, so they are the two halves of
+a request/response exchange. The panel has no sensors (3 wires only), so the sensor-carrying CE
+frames must come from the main board, and CF from the panel. The PV flag in CE matches the PV
+dry contact wired to the main board's terminals.
+
+This makes the **panel the controller** and the main board an I/O board:
+- CF carries nothing but the mode (heat / warm / defrost) and the EEV position;
+  every other CF payload byte is constant.
+- The **setpoint never crosses the bus** in either direction, so only the panel can decide when
+  the tank is hot enough.
+- The valve moves 1 step per 30 s in response to the superheat computed from CE sensors.
+  The superheat loop, and most likely the defrost decision, therefore run in the panel.
+
+Caveat: the sniffer only accepts CE/CF frames, so a rare settings frame (e.g. sent only on a menu
+change) would go unnoticed.
 
 ## Decoded fields
 
@@ -112,15 +126,16 @@ T (°C) = int16( (plain[i+1] << 8) | plain[i] ) / 10        plain[j] = dec[j] ^ 
 | low/high byte | sensor | heating → idle (2026-11-12) | name confidence |
 |---|---|---|---|
 | `dec[14/15]` | **water / tank** | 48.9 → 49.6 °C | ✅ checked against the display (OCR), 46–60 °C |
-| `dec[16/17]` | return gas (suction) | 1.6 → ~15 °C | provisional |
+| `dec[16/17]` | coil / evaporator | 1.6 → ~15 °C; drops first and lowest at compressor start | from superheat behaviour |
 | `dec[18/19]` | ambient / intake air | 13.5 → ~19.5 °C | provisional |
 | `dec[20/21]` | exhaust / discharge | 54.8 → decays after stop | provisional |
-| `dec[22/23]` | coil / evaporator | 1.8 → ~21 °C, spike at the end-of-cycle "defrost" | provisional |
+| `dec[22/23]` | return gas (suction) | 1.8 → ~21 °C; lags the coil, a little warmer while running | from superheat behaviour |
 
 The SY-384 schematic lists five channels (water, coil, ambient, exhaust, return gas), and
-all five carry live data. The names for 16/18/20/22 come from how each channel behaves
-when the compressor stops, not from board labels, so 16 and 22 in particular could be
-swapped.
+all five carry live data. The names come from behaviour, not board labels. Coil vs return
+gas is set by superheat (return gas − coil): with 16 = coil and 22 = return gas, the
+expansion valve (below) opens when superheat is high and closes when it is ~0, which is
+what a superheat controller does. The other way round, superheat would be negative.
 
 Stateless, no calibration constants, valid over the full range. The value is assumed
 signed (sub-zero coil readings in winter should then decode directly — not yet observed).
@@ -134,7 +149,45 @@ signed (sub-zero coil readings in winter should then decode directly — not yet
 
 ## Other fields
 
-`dec[24/26/28]` alternate between two values every few frames (protocol heartbeat, not
-sensor data). XOR-ed with the matching CF byte they read `127/128` and `191/192`.
-`cf[14]` is a heating-phase timer (clear text `cf[14] ^ 0x1D`; parks at `0xFD` → `0xE0` when idle).
-`cf[15] = 0x30` appears in a short burst with `cf[10] = 0x5D` at the end of each heating cycle.
+### Expansion valve position — `dec[14/15]` (CF frames)
+
+Same int16 layout and key as the tank (`1D` / `CF`), but in CF frames, and in **motor
+steps** rather than °C:
+
+| phase | value |
+|---|---|
+| idle | `480` (parked open, so pressures equalise) |
+| ~1 min after heating starts | jumps to `280` (start position) |
+| heating | ±1 step per 30 s: opens while superheat is high, closes while it is ~0 |
+| start of the end-of-run defrost (`cf[10] = 0x5D`, `cf[15] = 0x30`) | `-1` for ~2 s, then back to `480` |
+
+**Superheat control, observed 2026-11-12** (superheat = return gas `22` − coil `16`):
+- From 280 the valve closed one step per 30 s for ~90 min while superheat sat at 0.1–0.2 K
+  (flooded evaporator), down to ~100 steps.
+- From there it regulates with a dead band: **close** below ~3.5 K, **hold** between ~3.5 and
+  6.5 K, **open** above ~6.5 K. Target ≈ 5 K; the valve settled at 85–92 steps.
+
+### End of a heating run
+
+Seen on both runs on 2026-11-12, at setpoint 50 and at 60 °C:
+1. Heating stops when the tank reaches **setpoint − 0.5 °C** (49.5 / 59.5), i.e. when the
+   whole-degree display would round up to the setpoint.
+2. `cf[10]` goes to `0x5D` (**defrost**, the panel shows it). The compressor stops at once
+   (power 735 → ~15 W). The valve reads `-1` briefly, then parks at 480. The coil warms
+   from 0 to 8 °C within a minute as the pressures equalise.
+3. After exactly **60 s**, `cf[10]` goes to `0x59` (warm/idle).
+
+This short passive defrost at the end of a run is different from the 4–5 min mid-run defrosts.
+Those keep the compressor running (power rises to ~700–780 W).
+
+### Spare channels — `dec[24/25]`, `dec[26/27]`, `dec[28/29]` (CE frames)
+
+Keyed with the matching CF bytes (`56 E3`, `71 BC`, `3F 58`), these are three more int16
+slots that read a constant −12.8/−12.9 and −6.4/−6.5 with a one-count flicker: most likely
+inputs with nothing connected. (Earlier notes called them a "heartbeat".)
+
+### Not understood yet
+
+- `raw[5]`, the per-frame mask, is pseudo-random, not a counter.
+- `dec[4]` (CE) and `dec[2]` (CF) carry the same field at different offsets: `value ^ 0x5A`
+  is always `2^k − 1`, with `k = 1` half the time, `k = 2` a quarter, and so on.

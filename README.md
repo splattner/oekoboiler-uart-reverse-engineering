@@ -295,8 +295,8 @@ the 51–52 °C overlap seen in July.
 
 **Where does the key come from?** XOR any CE byte with the same position in a CF frame and
 many come out as `0`. The CF frames are mostly empty, so they **send the key in the clear**
-— `cf[16..23]` never change. Only `cf[14]` doesn't match, because the panel uses that slot
-for a timer; that's why the tank key had to be recovered from the traffic.
+— `cf[16..23]` never change. Only `cf[14]` doesn't match, because that slot carries the
+expansion-valve position; that's why the tank key had to be recovered from the traffic.
 
 **Did the new model really explain the old one?** I fed a smooth temperature sweep through
 the int16 model, ran the July decoder on the bytes, and compared with what Home Assistant
@@ -317,6 +317,29 @@ rounding the bit pattern.
 The other four sensors use the same layout and their own key bytes (all visible in CF).
 Every channel now reads in real °C, so the July caveat about "stretched magnitudes" is gone.
 
+### The test I'd been waiting for since July, and a valve
+
+A few hours later I switched PV mode on by hand (setpoint 60 °C), and the tank finally
+climbed through 51.2 °C with raw logging running. Prediction: at the crossing, `ce[15]`
+goes 206 → 205 *in the same frame* as the low byte rolls over, and `ce[14]` reads the key
+itself.
+
+```
+15:49:00  ce14=0xE2  ce15=206   plain 0x01FF  → 51.1 °C
+15:50:03  ce14=0x1D  ce15=205   plain 0x0200  → 51.2 °C
+15:50:06  ce14=0x1C  ce15=205   plain 0x0201  → 51.3 °C
+```
+
+The same key also unlocked `cf[14/15]`, a slot the July notes called a "heating timer".
+It's int16 too, but it doesn't behave like a timer. It sits at **480** while idle, jumps to
+**280** a minute after the compressor starts, then moves **one step every 30 seconds**,
+sometimes up and sometimes down. That's an **electronic expansion valve**, and the
+direction of each step gave away which sensor is which. Superheat (return gas − coil) only
+comes out positive with channel 16 as the coil and 22 as the return gas. With that mapping
+the valve opened while superheat was ~7 K and closed one step per 30 s while it sat at
+~0 K, which is what a superheat controller does. My first guess had those two names the
+wrong way round.
+
 ---
 
 ## Step 6 — ESPHome integration
@@ -333,10 +356,10 @@ if (masked_frame[11] == 0xCE) {
     return v / 10.0f;
   };
   id(water_temp).publish_state(t16(14, 0x1D, 0xCF));
-  id(return_gas_temp).publish_state(t16(16, 0x7E, 0x90));
+  id(coil_temp).publish_state(t16(16, 0x7E, 0x90));
   id(ambient_temp).publish_state(t16(18, 0x0F, 0x24));
   id(exhaust_temp).publish_state(t16(20, 0x60, 0xA1));
-  id(coil_temp).publish_state(t16(22, 0xEC, 0x5E));
+  id(return_gas_temp).publish_state(t16(22, 0xEC, 0x5E));
 }
 ```
 
@@ -349,8 +372,8 @@ No globals, no wrap tracking, correct straight after a reboot.
 > *July 2026 account. The identities below came from behaviour that is still valid in
 > spirit, but the byte values were read through the key (Step 5), so the "plunges / rises"
 > reasoning was looking at scrambled numbers. The current channel names are in
-> [`PROTOCOL.md`](PROTOCOL.md): `16/17` return gas, `18/19` ambient, `20/21` exhaust,
-> `22/23` coil — still provisional, and the return-gas channel is live, not unpopulated.*
+> [`PROTOCOL.md`](PROTOCOL.md): `16/17` coil, `18/19` ambient, `20/21` exhaust, `22/23`
+> return gas — and the return-gas channel is live, not unpopulated.*
 
 The tank isn't the only thing on the bus. Once I knew the tank was a `(fine, coarse)` byte **pair** (`ce14`+`ce15`), I checked whether the other "drift" bytes follow the same pattern — and they do, perfectly. Every fine byte (many values, wraps) has a companion coarse byte (just 2–4 values):
 
@@ -395,19 +418,21 @@ Full details in [`PROTOCOL.md`](PROTOCOL.md). The short version:
 | PV mode | `dec[10] & 0x40` (CE) | clear = PV on |
 | Second key | fixed per position, `14..23` = `1D CF 7E 90 0F 24 60 A1 EC 5E` | XOR on top of the `raw[5]` mask |
 | **Water temp** | **`dec[14/15]` (CE)** | **int16 LE, 0.1 °C** |
-| Return gas *(provisional)* | `dec[16/17]` (CE) | int16 LE, 0.1 °C |
+| Coil / evaporator | `dec[16/17]` (CE) | int16 LE, 0.1 °C |
 | Ambient *(provisional)* | `dec[18/19]` (CE) | int16 LE, 0.1 °C |
 | Exhaust *(provisional)* | `dec[20/21]` (CE) | int16 LE, 0.1 °C |
-| Coil *(provisional)* | `dec[22/23]` (CE) | int16 LE, 0.1 °C |
+| Return gas | `dec[22/23]` (CE) | int16 LE, 0.1 °C |
+| Expansion valve | `dec[14/15]` (**CF**) | int16 LE, motor steps; 480 idle, ~280 at start |
 | CRC | `raw[30..31]` | CRC-16/Modbus over `raw[0..29]`, little-endian |
 
 ---
 
 ## What's still open
 
-- **Channel names.** The four heat-pump channels decode to real °C, but which is coil and which is return gas is inferred from one heat-cycle end. A full idle → heating → idle cycle (and a winter defrost) should settle it.
+- **Channel names.** Coil vs return gas now follows from superheat and the expansion valve (see below); ambient vs exhaust is still from behaviour only. A clamp-on probe would settle them for good.
+- **Expansion valve.** `cf[14/15]` behaves like a superheat-controlled EEV in motor steps. Still to see: the valve stopping or reversing as superheat recovers.
 - **Tank ground truth.** The int16 model agrees with the OCR'd display over 46–60 °C; a day of OCR across a deep draw-off would confirm it below that.
-- **The rest of the frame.** With the key understood, the remaining CE/CF bytes (`cf[14]` timer, `24..29`, the mode bits) are worth another pass.
+- **The rest of the frame.** With the key understood, the remaining CE/CF bytes (`24..29`, the mode bits, the `ce[4]`/`cf[2]` nonce) are worth another pass.
 - **Setpoint** appears to be derived from PV state rather than sent as a plain number; still confirming.
 
 ---
