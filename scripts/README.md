@@ -5,7 +5,8 @@ Python 3 (no dependencies) except where noted.
 
 | Script | What it does |
 |---|---|
-| `decoder.py` | Reference implementation: framing, XOR demask, CRC, mode/PV, and **both** water-temperature decoders (stateless + continuity). Run directly for a self-test. This is the executable spec. |
+| `decoder.py` | Reference implementation: framing, XOR demask, CRC, mode/PV, the fixed second-layer key, and all five int16 temperature channels. Run directly for a self-test (real OCR samples + a synthetic frame round trip). This is the executable spec. |
+| `keyscan.py` | Finds the fixed XOR key of a slowly-changing byte: tries all 256 keys and keeps those that turn frame-to-frame changes into ±1 steps. How the tank key `0x1D` was found. Reads integers from stdin. |
 | `correlate.py` | Ranks every decoded byte by correlation with the OCR ground-truth temperature over a time window. The method that located the temperature byte. Reads InfluxDB via env vars. |
 
 ## Using `correlate.py`
@@ -25,4 +26,4 @@ cooling** — over pure monotonic cooling almost every byte correlates and the r
 meaningless. And remember the lag-scan caveat: confirm a candidate peaks at **lag 0**
 before believing it (see the main write-up).
 
-> `decoder.py` needs no InfluxDB — it works on raw 32-byte frames / `(ce14, ce15)` pairs.
+> `decoder.py` and `keyscan.py` need no InfluxDB: they work on raw 32-byte frames or plain byte values.

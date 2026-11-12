@@ -10,7 +10,8 @@ My [Ökoboiler](https://www.oekoboiler.com/) heat-pump water heater is an **olde
 
 So I tapped it with a €5 ESP32, captured the traffic, and reverse-engineered the protocol. The result is a local, cloud-free sensor that reads:
 
-- 🌡️ **Water (tank) temperature** — to ~0.3 °C, *better than the 1 °C front-panel display*
+- 🌡️ **Water (tank) temperature** — the controller's own 0.1 °C reading, *finer than the 1 °C front-panel display*
+- 🌀 **Four heat-pump sensors** — coil, exhaust, ambient and return gas, on the same scale
 - ⚙️ **Operating mode** (heating / idle / defrost)
 - ♻️ **PV / solar mode** — officially absent on my model, but fully present in the firmware; I just added the missing trigger (see below)
 
@@ -19,6 +20,11 @@ Two nice results came out of it. The **water temperature** was the hard one: it'
 ![The decoded water-temperature byte tracking the real temperature](images/fig_ce14_sawtooth_time.png)
 
 > The red sawtooth is a single byte off the bus; its envelope is the water temperature (black). Once you know it wraps, it decodes cleanly.
+
+> **Update, November 2026:** the "wrapping byte" turned out to be half of a plain 16-bit
+> number hidden behind a **second, fixed XOR key**. With that key every sensor is just
+> `int16 / 10` — no wrap tracking, no calibration. Steps 3–4 tell the July story as it
+> happened; [Step 5](#step-5--four-months-later-the-second-key) is the fix.
 
 ---
 
@@ -224,11 +230,15 @@ This `(fine that wraps, coarse band)` layout isn't an accident — it's what you
 
 So the wrap is a side effect of byte-splitting a higher-resolution value, and the coarse band is the high part that tells you which wrap you're in. Once you see it as "low byte + high byte of one number," it stops looking mysterious.
 
+*(Hindsight: "low byte + high byte of one number" was exactly right — but each byte is also XOR-ed with a fixed key, which is what made the low byte wrap every 6.4 °C instead of every 25.6 °C. See Step 5.)*
+
 </details>
 
 ---
 
 ## Step 4 — The decoder
+
+> *Superseded by Step 5: kept because it's how the sensor ran from July to November, and its quirks are what led to the real encoding.*
 
 Putting it together, temperature is:
 
@@ -250,48 +260,97 @@ Validated against the OCR ground truth over the whole sweep:
 
 ---
 
-## Step 5 — ESPHome integration
+## Step 5 — Four months later: the second key
+
+The July decoder ran in Home Assistant from July to November. Looking at four months of
+its output, two things were off:
+
+- **A hard floor.** On 17 days the daily minimum was *exactly* 46.42 °C — the lowest value
+  the decoder can produce. When a morning shower pulled the tank lower, the decoder folded
+  the reading up to ~52 °C instead.
+- **137 jumps of 3–6 °C** within a minute: continuity tracking counting a wrap that never
+  happened.
+
+Raw logging was back on, and the tank happened to be heating, so I looked at `ce[14]`
+frame by frame. Over a 0.8 °C rise it went:
+
+```
+244 → 247 → 246 → 241 → 240 → 243 → 242 → 237
+```
+
+That's no sawtooth; it looks scrambled. But XOR each value with `0x1D` and you get
+`233, 234, 235, 236, 237, 238, 239, 240`: **a plain counter, +1 per 0.1 °C.** A small
+script ([`scripts/keyscan.py`](scripts/keyscan.py)) does this for every possible key
+and keeps the ones that turn the byte into single steps.
+
+The coarse byte fell into place at once. `ce[15] ^ 0xCF` is `1` for the old "206" band and
+`2` for "205", so the tank is simply
+
+```
+T = ((ce[15] ^ 0xCF) << 8 | (ce[14] ^ 0x1D)) / 10        →   1·256 + 240 = 496 → 49.6 °C
+```
+
+and the mysterious band edge is where the low byte rolls over: **512 → 51.2 °C**, exactly
+the 51–52 °C overlap seen in July.
+
+**Where does the key come from?** XOR any CE byte with the same position in a CF frame and
+many come out as `0`. The CF frames are mostly empty, so they **send the key in the clear**
+— `cf[16..23]` never change. Only `cf[14]` doesn't match, because the panel uses that slot
+for a timer; that's why the tank key had to be recovered from the traffic.
+
+**Did the new model really explain the old one?** I fed a smooth temperature sweep through
+the int16 model, ran the July decoder on the bytes, and compared with what Home Assistant
+had logged. It reproduces the July decoder's quirks exactly: the floor at 46.42, the fold
+to 52.4, and the tiny backward steps it always made at the same values (52.34 → 52.04,
+53.13 → 52.83, 55.49 → 55.20…). **88 % of all 120 000 logged values** are values the model
+can produce (the rest are 15-second averages between two of them), including all 40 of the
+most frequent. The "0.3 °C error" from July was never sensor noise; it was the mod-64 fit
+rounding the bit pattern.
+
+![Old decoder vs int16 model, and all five channels decoded live](images/fig_int16_decode.png)
+
+> Left: what the July decoder makes of a true sweep — small backward steps all the way, and
+> a fold below 46.1 °C. Right: the same int16 rule applied to all five channels as a heat
+> cycle ends. The exhaust decays, coil and return gas warm from ~2 °C toward the garage
+> temperature, and the tank stays put.
+
+The other four sensors use the same layout and their own key bytes (all visible in CF).
+Every channel now reads in real °C, so the July caveat about "stretched magnitudes" is gone.
+
+---
+
+## Step 6 — ESPHome integration
 
 The whole thing runs on an ESP32 as an ESPHome UART sniffer that publishes to Home Assistant. The decode is a small lambda; see [`esphome/oekoboiler-sniffer.yaml`](esphome/oekoboiler-sniffer.yaml) for the complete, ready-to-flash config (with your own secrets). The core of it:
 
 ```cpp
-// CE frames only, CRC-valid. byte14 = fine temp (wraps), byte15 = coarse band.
+// CE frames only, CRC-valid. masked_frame = payload after the raw[5] demask.
 if (masked_frame[11] == 0xCE) {
-  const float WT_A = 60.62f, WT_B = 0.0986f;   // T = A - B*(fine + acc)
-  int fine = masked_frame[14] % 64;
-  int b15  = masked_frame[15];
-
-  // Decoder A: continuity, re-anchored in the unambiguous b15==206 band
-  if (b15 == 206) {
-    id(wt_acc) = 64 * (int) lroundf((112.8f - fine) / 64.0f);
-    id(wt_anchored) = true;
-  } else if (!id(wt_anchored)) {
-    id(wt_acc) = 64 * (int) lroundf((51.9f - fine) / 64.0f);
-    id(wt_anchored) = true;
-  } else {
-    int d = fine - id(wt_prev_fine);
-    if (d > 32) id(wt_acc) -= 64;
-    else if (d < -32) id(wt_acc) += 64;
-  }
-  id(wt_prev_fine) = fine;
-  id(water_temp_continuity).publish_state(WT_A - WT_B * (fine + id(wt_acc)));
-
-  // Decoder B: stateless
-  int raw = masked_frame[14];
-  float center = (b15 == 206) ? 49.5f : 55.5f;
-  int k = (int) lroundf((((WT_A - center) / WT_B) - fine) / 64.0f);
-  float tempB = WT_A - WT_B * (fine + 64 * k);
-  if (b15 != 206) {
-    if (raw >= 64 && tempB < 57.0f) tempB = WT_A - WT_B * (fine + 64 * (k - 1));
-    if (raw <  64 && tempB > 57.5f) tempB = WT_A - WT_B * (fine + 64 * (k + 1));
-  }
-  id(water_temp_stateless).publish_state(tempB);
+  // remove the fixed per-position key, read a signed little-endian int16, 0.1 degC
+  auto t16 = [&](int i, uint8_t klo, uint8_t khi) -> float {
+    int16_t v = (int16_t) (((uint16_t) (masked_frame[i + 1] ^ khi) << 8) |
+                            (uint8_t) (masked_frame[i] ^ klo));
+    return v / 10.0f;
+  };
+  id(water_temp).publish_state(t16(14, 0x1D, 0xCF));
+  id(return_gas_temp).publish_state(t16(16, 0x7E, 0x90));
+  id(ambient_temp).publish_state(t16(18, 0x0F, 0x24));
+  id(exhaust_temp).publish_state(t16(20, 0x60, 0xA1));
+  id(coil_temp).publish_state(t16(22, 0xEC, 0x5E));
 }
 ```
+
+No globals, no wrap tracking, correct straight after a reboot.
 
 ---
 
 ## Bonus: mapping the other four sensors
+
+> *July 2026 account. The identities below came from behaviour that is still valid in
+> spirit, but the byte values were read through the key (Step 5), so the "plunges / rises"
+> reasoning was looking at scrambled numbers. The current channel names are in
+> [`PROTOCOL.md`](PROTOCOL.md): `16/17` return gas, `18/19` ambient, `20/21` exhaust,
+> `22/23` coil — still provisional, and the return-gas channel is live, not unpopulated.*
 
 The tank isn't the only thing on the bus. Once I knew the tank was a `(fine, coarse)` byte **pair** (`ce14`+`ce15`), I checked whether the other "drift" bytes follow the same pattern — and they do, perfectly. Every fine byte (many values, wraps) has a companion coarse byte (just 2–4 values):
 
@@ -318,7 +377,7 @@ Defrost also appears in the mode field, but only as a **~2-minute blip at the en
 
 > The defrost band (violet, ~2 min) sits right at the end of heating. The coil is at its coldest there, then recovers to ambient as the compressor stops — **no hot-gas spike**, so in a warm garage this reads as an end-of-cycle routine rather than real ice-melting. (A winter defrost might look different — worth revisiting.)
 
-**The honest caveat:** these absolute numbers are *approximate*. I assumed the tank's slope (~10 units/°C) for every channel, which is almost certainly too steep — ambient swings wider than the room really does, and the coil bottoms out at an unrealistic −30 °C. **The shapes and identities are solid; the magnitudes are stretched.** Each sensor has its own scale that I can't pin without per-channel ground truth (a clamp-on probe for the coil/exhaust; a wider room-temperature swing for ambient). But even uncalibrated, the coil trace is a superb evaporator/defrost signal, and ambient is good to a degree or two.
+**The honest caveat (July):** these absolute numbers are *approximate*. I assumed the tank's slope (~10 units/°C) for every channel, which is almost certainly too steep — ambient swings wider than the room really does, and the coil bottoms out at an unrealistic −30 °C. **The shapes and identities are solid; the magnitudes are stretched.** Each sensor has its own scale that I can't pin without per-channel ground truth (a clamp-on probe for the coil/exhaust; a wider room-temperature swing for ambient). But even uncalibrated, the coil trace is a superb evaporator/defrost signal, and ambient is good to a degree or two.
 
 ---
 
@@ -334,20 +393,21 @@ Full details in [`PROTOCOL.md`](PROTOCOL.md). The short version:
 | Frame family | `dec[11] = CE / CF` | Direction / message type |
 | Operating mode | `dec[10] & 0x1F` (CF) | `10`=heat `19`=idle `1D`=defrost |
 | PV mode | `dec[10] & 0x40` (CE) | clear = PV on |
-| **Water temp (fine)** | **`dec[14]` (CE)** | **~10 units/°C, wraps ~6.4 °C, falls as temp rises** |
-| **Water temp (coarse band)** | **`dec[15]` (CE)** | **206 ⇒ 47–52 °C, 205 ⇒ 51–60 °C** |
-| Ambient / intake | `dec[16]/[17]` (CE) | `(fine,coarse)` pair, same format |
-| Evaporator / coil | `dec[20]/[21]` (CE) | `(fine,coarse)` pair |
-| Exhaust / discharge | `dec[22]/[23]` (CE) | `(fine,coarse)` pair |
-| Return gas | `dec[18]/[19]` (CE) | present in format, sensor unpopulated |
+| Second key | fixed per position, `14..23` = `1D CF 7E 90 0F 24 60 A1 EC 5E` | XOR on top of the `raw[5]` mask |
+| **Water temp** | **`dec[14/15]` (CE)** | **int16 LE, 0.1 °C** |
+| Return gas *(provisional)* | `dec[16/17]` (CE) | int16 LE, 0.1 °C |
+| Ambient *(provisional)* | `dec[18/19]` (CE) | int16 LE, 0.1 °C |
+| Exhaust *(provisional)* | `dec[20/21]` (CE) | int16 LE, 0.1 °C |
+| Coil *(provisional)* | `dec[22/23]` (CE) | int16 LE, 0.1 °C |
 | CRC | `raw[30..31]` | CRC-16/Modbus over `raw[0..29]`, little-endian |
 
 ---
 
 ## What's still open
 
-- **Calibration range.** The temperature constants are fitted over **47–60 °C** (all my tank has done during capture). Outside that, `ce[15]` takes values I haven't mapped yet. A big draw down toward ~40 °C plus a full reheat will extend it, and the constants get refined into a single closed-form.
-- **Absolute calibration of the other sensors.** Ambient, coil and exhaust are now *identified* (see the section above) but their absolute magnitudes are approximate — each needs its own scale. Coil/exhaust would need a **clamp-on probe** on the pipe; ambient just needs the room to swing over a wider range. (Return gas is a dead channel — unpopulated.)
+- **Channel names.** The four heat-pump channels decode to real °C, but which is coil and which is return gas is inferred from one heat-cycle end. A full idle → heating → idle cycle (and a winter defrost) should settle it.
+- **Tank ground truth.** The int16 model agrees with the OCR'd display over 46–60 °C; a day of OCR across a deep draw-off would confirm it below that.
+- **The rest of the frame.** With the key understood, the remaining CE/CF bytes (`cf[14]` timer, `24..29`, the mode bits) are worth another pass.
 - **Setpoint** appears to be derived from PV state rather than sent as a plain number; still confirming.
 
 ---
@@ -357,7 +417,8 @@ Full details in [`PROTOCOL.md`](PROTOCOL.md). The short version:
 1. **Spot-checks lie.** With multiple correlated sensors, matching a byte to a value at a few moments will hand you false positives all day. You need labelled data across a real *sweep*.
 2. **Correlation needs the right event.** Monotonic cooling makes everything correlate; a *heating* cycle is what separates the tank from the coil.
 3. **The lag scan is underrated.** "Where does the correlation peak in time?" cleanly separates a real-time readout (lag 0) from a coincidental daily-rhythm partner (lag ≠ 0).
-4. **"Noise" can be signal at the wrong resolution.** The temperature byte looked random only because it's finer than the display and wraps. Look at raw rate, reconstruct frames, and check *stability when the input is stable* before dismissing a byte.
+4. **Look for a second layer before fitting curves.** A byte that steps by "almost ±1, but not quite" is a counter seen through an XOR. Checking frame-to-frame transitions against all 256 keys took seconds; the curve fit took days and was still wrong at the edges.
+5. **"Noise" can be signal at the wrong resolution.** The temperature byte looked random only because it's finer than the display and wraps. Look at raw rate, reconstruct frames, and check *stability when the input is stable* before dismissing a byte.
 
 ---
 
@@ -367,7 +428,7 @@ Full details in [`PROTOCOL.md`](PROTOCOL.md). The short version:
 esphome/oekoboiler-sniffer.yaml   Full ESPHome config (UART sniffer + decoders)
 PROTOCOL.md                       Byte-level protocol reference
 images/                           Figures used in this write-up
-scripts/                          Analysis helpers (InfluxDB correlation, plotting)
+scripts/                          Reference decoder, key scanner, InfluxDB correlation
 ```
 
 ## Acknowledgements & prior art

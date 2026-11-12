@@ -72,35 +72,19 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
-  # --- water-temperature continuity decoder state ---
-  - id: wt_acc          # wrap accumulator (multiples of 64)
-    type: int
-    restore_value: no
-    initial_value: '0'
-  - id: wt_prev_fine    # previous fine value
-    type: int
-    restore_value: no
-    initial_value: '-1'
-  - id: wt_anchored     # has an absolute anchor been set?
-    type: bool
-    restore_value: no
-    initial_value: 'false'
 
 binary_sensor:
   - platform: template
     name: "PV Mode"
     id: pv_mode
     device_class: running
-  # flags when the two water-temp decoders disagree (missed wrap / out-of-calibration)
-  - platform: template
-    name: "Water Temp Decoders Disagree"
-    id: water_temp_mismatch
-    device_class: problem
 
 switch:
+  # Decoding always runs; this only controls publishing every frame to MQTT
+  # (oekoboiler/frame) for offline analysis.
   - platform: template
-    name: "UART Sniffing"
-    id: uart_sniffing
+    name: "Send Raw UART Data"
+    id: uart_debug
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
 
@@ -110,9 +94,21 @@ text_sensor:
     id: boiler_mode
 
 sensor:
+  # All five sensor channels are int16 little-endian, 0.1 degC (see PROTOCOL.md).
   - platform: template
-    name: "Water Temperature (continuity)"
-    id: water_temp_continuity
+    name: "Water Temperature"
+    id: water_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle_average: 15s
+  # Channel names for the four heat-pump sensors are provisional: identified from
+  # their behaviour across heating -> idle, not from labels on the board.
+  - platform: template
+    name: "Return Gas Temperature"        # dec[16/17]: ~2 degC while heating, rises to ambient after
+    id: return_gas_temp
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -120,8 +116,26 @@ sensor:
     filters:
       - throttle_average: 15s
   - platform: template
-    name: "Water Temperature (stateless)"
-    id: water_temp_stateless
+    name: "Ambient Temperature"           # dec[18/19]: intake air, dips while the fan runs
+    id: ambient_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle_average: 15s
+  - platform: template
+    name: "Exhaust Temperature"           # dec[20/21]: hot side, decays after the compressor stops
+    id: exhaust_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle_average: 15s
+  - platform: template
+    name: "Coil Temperature"              # dec[22/23]: evaporator, ~2 degC while heating
+    id: coil_temp
     unit_of_measurement: "°C"
     device_class: temperature
     state_class: measurement
@@ -141,8 +155,8 @@ interval:
   - interval: 100ms
     then:
       - lambda: |-
-          // Skip processing until MQTT is connected and ready, and sniffing is enabled
-          if (!id(mqtt_ready) || !id(uart_sniffing).state) return;
+          // Skip processing until MQTT is connected and ready
+          if (!id(mqtt_ready)) return;
           auto *uart = id(boiler_uart);
           auto &buf = id(frame_buffer);
           size_t bytes_read = 0;
@@ -238,7 +252,7 @@ interval:
             // frame can never flip PV/mode/temperature to a wrong value.
             if (crc_calc == crc_frame) {
 
-              // ===== CE frames: PV mode + water temperature =====
+              // ===== CE frames: PV mode + all temperatures =====
               if (masked_frame[11] == 0xCE) {
 
                 // --- PV Mode: byte 10 bit 0x40 clear = PV on ---
@@ -251,46 +265,24 @@ interval:
                 if (!id(water_setpoint).has_state() || setpoint != id(water_setpoint).state)
                   id(water_setpoint).publish_state(setpoint);
 
-                // --- Water temperature ---
-                // byte14 = fine temp (~10 units/degC, byte falls as temp rises, wraps every ~6.4 degC)
-                // byte15 = coarse band: 206 => ~47-52 degC, 205 => ~51-60 degC
-                // Calibrated over 47-60 degC (2026-07-07/08). ~0.3 degC mean error vs OCR.
-                const float WT_A = 60.62f, WT_B = 0.0986f;   // temp = A - B*(fine + acc)
-                int fine = masked_frame[14] % 64;
-                int b15  = masked_frame[15];
-
-                // --- Decoder B: stateless (no memory, survives reboots) ---
-                // Computed FIRST so it can seed the continuity decoder's cold start.
-                int raw = masked_frame[14];
-                float center = (b15 == 206) ? 49.5f : 55.5f;
-                int kB = (int) lroundf((((WT_A - center) / WT_B) - fine) / 64.0f);
-                float tempB = WT_A - WT_B * (fine + 64 * kB);
-                if (b15 != 206) {                            // 205 band > 1 wrap: full-byte tiebreak
-                  if (raw >= 64 && tempB < 57.0f) { kB -= 1; tempB = WT_A - WT_B * (fine + 64 * kB); }
-                  if (raw <  64 && tempB > 57.5f) { kB += 1; tempB = WT_A - WT_B * (fine + 64 * kB); }
-                }
-                id(water_temp_stateless).publish_state(tempB);
-
-                // --- Decoder A: continuity, re-anchored in the unambiguous b15==206 band ---
-                if (b15 == 206) {                            // 47-52 degC: one wrap wide => absolute
-                  id(wt_acc) = 64 * (int) lroundf((112.8f - fine) / 64.0f);
-                  id(wt_anchored) = true;
-                } else if (!id(wt_anchored)) {               // cold start: seed from the stateless wrap
-                  id(wt_acc) = 64 * kB;
-                  id(wt_anchored) = true;
-                } else {                                     // track wraps frame-to-frame
-                  int d = fine - id(wt_prev_fine);
-                  if (d > 32) id(wt_acc) -= 64;
-                  else if (d < -32) id(wt_acc) += 64;
-                }
-                id(wt_prev_fine) = fine;
-                float tempA = WT_A - WT_B * (fine + id(wt_acc));
-                id(water_temp_continuity).publish_state(tempA);
-
-                // --- flag when the two decoders disagree by > 1 degC ---
-                bool mismatch = fabsf(tempA - tempB) > 1.0f;
-                if (mismatch != id(water_temp_mismatch).state)
-                  id(water_temp_mismatch).publish_state(mismatch);
+                // --- Temperatures ---
+                // After the raw[5] demask, the payload carries a second, FIXED per-position
+                // XOR key (CF frames send most of it in the clear). Removing it turns every
+                // sensor pair into a signed int16, little-endian, in 0.1 degC. Stateless:
+                // no wrap tracking, no bands, valid over the whole range.
+                auto t16 = [&](int i, uint8_t klo, uint8_t khi) -> float {
+                  int16_t v = (int16_t) (((uint16_t) (masked_frame[i + 1] ^ khi) << 8) |
+                                          (uint8_t) (masked_frame[i] ^ klo));
+                  return v / 10.0f;
+                };
+                auto pub = [](sensor::Sensor *s, float t) {
+                  if (t > -40.0f && t < 120.0f) s->publish_state(t);   // plausibility guard
+                };
+                pub(id(water_temp),      t16(14, 0x1D, 0xCF));
+                pub(id(return_gas_temp), t16(16, 0x7E, 0x90));
+                pub(id(ambient_temp),    t16(18, 0x0F, 0x24));
+                pub(id(exhaust_temp),    t16(20, 0x60, 0xA1));
+                pub(id(coil_temp),       t16(22, 0xEC, 0x5E));
               }
 
               // ===== CF frames: operating mode (lower 5 bits of byte 10) =====
@@ -304,12 +296,13 @@ interval:
                   id(boiler_mode).publish_state(mode_str.c_str());
               }
 
-              ESP_LOGV("oekoboiler", "Valid frame received, yeah: %s", raw_str);
-              id(mqtt_client).publish("oekoboiler/frame", payload);
+              ESP_LOGV("oekoboiler", "Valid frame received: %s", raw_str);
+              if (id(uart_debug).state)
+                id(mqtt_client).publish("oekoboiler/frame", payload);
             } else {
               ESP_LOGV("oekoboiler", "CRC mismatch for frame %s(calc=0x%04X recv=0x%04X)", raw_str, crc_calc, crc_frame);
-              bool pub_ok = id(mqtt_client).publish("oekoboiler/raw", payload);
-
+              if (id(uart_debug).state)
+                id(mqtt_client).publish("oekoboiler/raw", payload);
             }
 
             // Consume the processed frame from the buffer
