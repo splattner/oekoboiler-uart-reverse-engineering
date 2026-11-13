@@ -331,8 +331,8 @@ itself.
 ```
 
 The same key also unlocked `cf[14/15]`, a slot the July notes called a "heating timer".
-It's int16 too, but it doesn't behave like a timer. It sits at **480** while idle, jumps to
-**280** a minute after the compressor starts, then moves **one step every 30 seconds**,
+It's int16 too, but it doesn't behave like a timer. It sits at **480** while idle, jumps to a
+start position (**255–282**, it varies per run) a minute after the compressor starts, then moves **one step every 30 seconds**,
 sometimes up and sometimes down. That's an **electronic expansion valve**, and the
 direction of each step gave away which sensor is which. Superheat (return gas − coil) only
 comes out positive with channel 16 as the coil and 22 as the return gas. With that mapping
@@ -422,7 +422,7 @@ Full details in [`PROTOCOL.md`](PROTOCOL.md). The short version:
 | Ambient *(provisional)* | `dec[18/19]` (CE) | int16 LE, 0.1 °C |
 | Exhaust *(provisional)* | `dec[20/21]` (CE) | int16 LE, 0.1 °C |
 | Return gas | `dec[22/23]` (CE) | int16 LE, 0.1 °C |
-| Expansion valve | `dec[14/15]` (**CF**) | int16 LE, motor steps; 480 idle, ~280 at start |
+| Expansion valve | `dec[14/15]` (**CF**) | int16 LE, motor steps; 480 idle, 255–282 at start |
 | CRC | `raw[30..31]` | CRC-16/Modbus over `raw[0..29]`, little-endian |
 
 ---
@@ -432,8 +432,8 @@ Full details in [`PROTOCOL.md`](PROTOCOL.md). The short version:
 - **Channel names.** Coil vs return gas now follows from superheat and the expansion valve (see below); ambient vs exhaust is still from behaviour only. A clamp-on probe would settle them for good.
 - **Tank ground truth.** The int16 model agrees with the OCR'd display over 46–60 °C; a day of OCR across a deep draw-off would confirm it below that.
 - **The rest of the frame.** With the key understood, the remaining CE/CF bytes (`24..29`, the mode bits) are worth another pass. The `ce[4]`/`cf[2]` "nonce" turned out to be a check byte computed from the mask: `((raw[5] ^ 0x5A) + 1)` (see PROTOCOL.md).
-- **Restart threshold.** Heating stops at setpoint − 0.5 °C; where it restarts is still to be seen (more than 0.4 K below the setpoint).
-- **Setpoint** appears to be derived from PV state rather than sent as a plain number; still confirming.
+- **Restart threshold at the 50 °C setpoint.** At 60 °C heating starts below setpoint − 4.5 °C and stops at setpoint − 0.5 °C (see PROTOCOL.md); the 50 °C case (start at 45.4?) hasn't been seen yet.
+- **Setpoint.** It never crosses the bus. The panel switches between its two setpoints within a second of the PV flag changing, so they live in the panel; their values are only known from the display.
 
 ---
 

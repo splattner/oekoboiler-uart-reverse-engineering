@@ -157,12 +157,12 @@ steps** rather than °C:
 | phase | value |
 |---|---|
 | idle | `480` (parked open, so pressures equalise) |
-| ~1 min after heating starts | jumps to `280` (start position) |
+| ~1 min after heating starts | jumps to a start position: `255`–`282` seen, varies per run |
 | heating | ±1 step per 30 s: opens while superheat is high, closes while it is ~0 |
 | start of the end-of-run defrost (`cf[10] = 0x5D`, `cf[15] = 0x30`) | `-1` for ~2 s, then back to `480` |
 
 **Superheat control, observed 2026-11-12** (superheat = return gas `22` − coil `16`):
-- From 280 the valve closed one step per 30 s for ~90 min while superheat sat at 0.1–0.2 K
+- From the start position (280 that day) the valve closed one step per 30 s for ~90 min while superheat sat at 0.1–0.2 K
   (flooded evaporator), down to ~100 steps.
 - From there it regulates with a dead band: **close** below ~3.5 K, **hold** between ~3.5 and
   6.5 K, **open** above ~6.5 K. Target ≈ 5 K; the valve settled at 85–92 steps.
@@ -179,6 +179,28 @@ Seen on both runs on 2026-11-12, at setpoint 50 and at 60 °C:
 
 This short passive defrost at the end of a run is different from the 4–5 min mid-run defrosts.
 Those keep the compressor running (power rises to ~700–780 W).
+
+### Start threshold and the PV contact
+
+Seen on 2026-11-13 (setpoint 60 °C with PV on, 50 °C with PV off):
+- **Start:** heating starts when the tank drops **below setpoint − 4.5 °C**. With PV on, the
+  tank sat at 56.2 °C for two hours without a start; the panel switched to heating within 1 s
+  of the first 55.4 °C reading. Together with the stop at setpoint − 0.5 this is a 4 K band
+  (display: stop at 60, start at 55). Only seen at the 60 °C setpoint so far.
+- **PV on:** the main board sets the PV flag in CE (`ce[10]` `0x59` → `0x19`). If the tank is
+  already below the new start threshold, the panel starts heating in the **same second**.
+- **PV off while heating:** the flag clears, the setpoint falls back to 50 °C, and if the tank
+  is above 49.5 °C the panel stops **1 s later** with the normal end-of-run sequence (`0x5D`,
+  60 s, then idle). The run does not continue to the old setpoint.
+
+The panel itself enforced no minimum compressor off-time in these cases. Any anti-flapping
+delay has to come from whatever drives the PV contact.
+
+**Caveat for efficiency estimates:** the tank has a single sensor. After a hot-water draw,
+cold water at the bottom can sit below the sensor: on 2026-11-13 the tank reading *fell*
+55.6 → 54.1 °C during an hour of heating, while the discharge temperature (36 → 50 °C) stayed
+below the tank reading. Heat was going into the bottom layer that the sensor does not see, so
+a COP computed from the tank sensor is only meaningful for runs that start without a draw.
 
 ### Spare channels — `dec[24/25]`, `dec[26/27]`, `dec[28/29]` (CE frames)
 
